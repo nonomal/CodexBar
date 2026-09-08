@@ -8,7 +8,7 @@ protocol ManagedCodexHomeProducing: Sendable {
 }
 
 protocol ManagedCodexLoginRunning: Sendable {
-    func run(homePath: String, timeout: TimeInterval) async -> CodexLoginRunner.Result
+    func run(homePath: String, timeout: TimeInterval) async -> CLILoginRunner.Result
 }
 
 protocol ManagedCodexIdentityReading: Sendable {
@@ -35,10 +35,25 @@ protocol ManagedCodexWorkspaceSelecting: Sendable {
 }
 
 enum ManagedCodexAccountServiceError: Error, Equatable {
-    case loginFailed
+    case loginFailed(CLILoginRunner.Result)
     case missingEmail
     case workspaceSelectionCancelled
     case unsafeManagedHome(String)
+}
+
+extension ManagedCodexAccountServiceError {
+    var userFacingMessage: String {
+        switch self {
+        case let .loginFailed(result):
+            CodexLoginAlertPresentation.managedLoginFailureMessage(for: result)
+        case .missingEmail:
+            L("managed_login_missing_email")
+        case .workspaceSelectionCancelled:
+            L("workspace_selection_cancelled")
+        case let .unsafeManagedHome(path):
+            String(format: L("unsafe_managed_home"), path)
+        }
+    }
 }
 
 struct ManagedCodexHomeFactory: ManagedCodexHomeProducing {
@@ -77,7 +92,7 @@ struct ManagedCodexHomeFactory: ManagedCodexHomeProducing {
 }
 
 struct DefaultManagedCodexLoginRunner: ManagedCodexLoginRunning {
-    func run(homePath: String, timeout: TimeInterval) async -> CodexLoginRunner.Result {
+    func run(homePath: String, timeout: TimeInterval) async -> CLILoginRunner.Result {
         await CodexLoginRunner.run(homePath: homePath, timeout: timeout)
     }
 }
@@ -232,7 +247,7 @@ final class ManagedCodexAccountService {
 
         do {
             let result = await self.loginRunner.run(homePath: homeURL.path, timeout: timeout)
-            guard case .success = result.outcome else { throw ManagedCodexAccountServiceError.loginFailed }
+            guard case .success = result.outcome else { throw ManagedCodexAccountServiceError.loginFailed(result) }
 
             let identity = try self.identityReader.loadAccountIdentity(homePath: homeURL.path)
             guard let rawEmail = identity.email?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -242,7 +257,7 @@ final class ManagedCodexAccountService {
             }
             let authenticatedProviderAccountID: String? = switch identity.identity {
             case let .providerAccount(id):
-                ManagedCodexAccount.normalizeProviderAccountID(id)
+                ManagedCodexAccount.normalizeWorkspaceAccountID(id)
             case .emailOnly, .unresolved:
                 nil
             }
@@ -349,7 +364,6 @@ final class ManagedCodexAccountService {
         else {
             throw ManagedCodexAccountServiceError.workspaceSelectionCancelled
         }
-        try self.persistSelectedWorkspaceID(selected.workspaceAccountID, homePath: homePath)
         return selected
     }
 
@@ -361,21 +375,6 @@ final class ManagedCodexAccountService {
         return await self.workspaceResolver.resolveWorkspaceIdentity(
             homePath: homePath,
             providerAccountID: providerAccountID)
-    }
-
-    private func persistSelectedWorkspaceID(_ workspaceID: String, homePath: String) throws {
-        let env = CodexHomeScope.scopedEnvironment(
-            base: ProcessInfo.processInfo.environment,
-            codexHome: homePath)
-        let credentials = try CodexOAuthCredentialsStore.load(env: env)
-        try CodexOAuthCredentialsStore.save(
-            CodexOAuthCredentials(
-                accessToken: credentials.accessToken,
-                refreshToken: credentials.refreshToken,
-                idToken: credentials.idToken,
-                accountId: workspaceID,
-                lastRefresh: credentials.lastRefresh),
-            env: env)
     }
 
     private func reconciledExistingAccount(
@@ -395,7 +394,7 @@ final class ManagedCodexAccountService {
         if let existingAccountID,
            let existingByID = snapshot.account(id: existingAccountID),
            existingByID.email == Self.normalizeEmail(authenticatedEmail),
-           providerAccountID == nil || existingByID.providerAccountID == nil
+           providerAccountID == nil || existingByID.effectiveWorkspaceAccountID == nil
         {
             return existingByID
         }
@@ -424,7 +423,7 @@ final class ManagedCodexAccountService {
             let legacySameEmailIDs = snapshot.accounts
                 .filter {
                     $0.id != matchedAccountID &&
-                        $0.providerAccountID == nil &&
+                        $0.effectiveWorkspaceAccountID == nil &&
                         $0.email == normalizedEmail
                 }
                 .map(\.id)
@@ -438,7 +437,7 @@ final class ManagedCodexAccountService {
             return ids
         }
 
-        if existingByID.providerAccountID == nil,
+        if existingByID.effectiveWorkspaceAccountID == nil,
            existingByID.email == normalizedEmail,
            providerAccountID != nil
         {
@@ -460,7 +459,8 @@ final class ManagedCodexAccountService {
         workspaceAccountID: String?)
     {
         if let authenticatedProviderAccountID {
-            let isExistingProviderMatch = existingAccount?.providerAccountID == authenticatedProviderAccountID
+            let isExistingProviderMatch =
+                existingAccount?.effectiveWorkspaceAccountID == authenticatedProviderAccountID
             return (
                 providerAccountID: authenticatedProviderAccountID,
                 workspaceLabel: resolvedWorkspaceIdentity?.workspaceLabel
@@ -470,13 +470,13 @@ final class ManagedCodexAccountService {
                     authenticatedProviderAccountID)
         }
 
-        guard let existingAccount, existingAccount.providerAccountID != nil else {
+        guard let existingAccount, existingAccount.effectiveWorkspaceAccountID != nil else {
             return (providerAccountID: nil, workspaceLabel: nil, workspaceAccountID: nil)
         }
 
         return (
             providerAccountID: existingAccount.providerAccountID,
             workspaceLabel: existingAccount.workspaceLabel,
-            workspaceAccountID: existingAccount.workspaceAccountID ?? existingAccount.providerAccountID)
+            workspaceAccountID: existingAccount.effectiveWorkspaceAccountID)
     }
 }

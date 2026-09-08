@@ -6,7 +6,9 @@ enum StatusItemMenuProviderNavigationDirection {
 }
 
 protocol StatusItemMenuPersistentActionDelegate: AnyObject {
-    func performPersistentRefreshAction()
+    func performPersistentRefreshAction(
+        in menuID: ObjectIdentifier,
+        menuInteractionGeneration: Int)
     func performPersistentSettingsAction()
     func performPersistentQuitAction()
     func performProviderNavigation(_ direction: StatusItemMenuProviderNavigationDirection)
@@ -14,12 +16,20 @@ protocol StatusItemMenuPersistentActionDelegate: AnyObject {
 
 final class StatusItemMenu: NSMenu {
     weak var persistentActionDelegate: StatusItemMenuPersistentActionDelegate?
+    var menuInteractionGeneration: Int?
+
+    func requestPersistentRefreshAction() {
+        guard let menuInteractionGeneration else { return }
+        self.persistentActionDelegate?.performPersistentRefreshAction(
+            in: ObjectIdentifier(self),
+            menuInteractionGeneration: menuInteractionGeneration)
+    }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         if let action = Self.persistentAction(for: event) {
             switch action {
             case .refresh:
-                self.persistentActionDelegate?.performPersistentRefreshAction()
+                self.requestPersistentRefreshAction()
             case .settings:
                 self.persistentActionDelegate?.performPersistentSettingsAction()
             case .quit:
@@ -43,6 +53,10 @@ final class StatusItemMenu: NSMenu {
         case quit
     }
 
+    nonisolated static func isPersistentRefreshShortcut(for event: NSEvent) -> Bool {
+        self.persistentAction(for: event) == .refresh
+    }
+
     private nonisolated static func persistentAction(for event: NSEvent) -> PersistentAction? {
         guard event.type == .keyDown else { return nil }
 
@@ -61,7 +75,7 @@ final class StatusItemMenu: NSMenu {
         }
     }
 
-    private nonisolated static func providerNavigationDirection(
+    nonisolated static func providerNavigationDirection(
         for event: NSEvent) -> StatusItemMenuProviderNavigationDirection?
     {
         guard event.type == .keyDown else { return nil }
@@ -75,5 +89,19 @@ final class StatusItemMenu: NSMenu {
         default:
             return nil
         }
+    }
+
+    nonisolated static func providerSelectionIndex(for event: NSEvent) -> Int? {
+        guard event.type == .keyDown else { return nil }
+        let relevantModifiers = event.modifierFlags.intersection([.command, .option, .control, .shift])
+        guard relevantModifiers == .command,
+              let characters = event.charactersIgnoringModifiers,
+              characters.count == 1,
+              let number = Int(characters),
+              (1...9).contains(number)
+        else {
+            return nil
+        }
+        return number - 1
     }
 }

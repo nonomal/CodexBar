@@ -22,12 +22,15 @@ public enum CodexActiveSourceResolver {
             .liveSystem
         case let .managedAccount(id):
             if let activeStoredAccount = snapshot.activeStoredAccount {
-                self.matchesLiveSystemAccount(
-                    storedAccount: activeStoredAccount,
-                    snapshot: snapshot,
-                    liveSystemAccount: snapshot.liveSystemAccount) ? .liveSystem : .managedAccount(id: id)
+                self.resolvedSource(for: activeStoredAccount, snapshot: snapshot)
             } else {
                 snapshot.liveSystemAccount != nil ? .liveSystem : .managedAccount(id: id)
+            }
+        case let .profileHome(path):
+            if let normalizedPath = snapshot.configuredProfileHomePath(path: path) {
+                self.resolvedProfileSource(path: normalizedPath, snapshot: snapshot)
+            } else {
+                .liveSystem
             }
         }
 
@@ -36,12 +39,49 @@ public enum CodexActiveSourceResolver {
             resolvedSource: resolvedSource)
     }
 
+    private static func resolvedProfileSource(
+        path: String,
+        snapshot: CodexAccountReconciliationSnapshot) -> CodexActiveSource
+    {
+        if let livePath = snapshot.liveSystemAccount.flatMap({
+            CodexHomeScope.normalizedHomePath($0.codexHomePath)
+        }), livePath == path {
+            return .liveSystem
+        }
+
+        if let storedAccount = snapshot.storedAccounts.first(where: {
+            CodexHomeScope.normalizedHomePath($0.managedHomePath) == path
+        }) {
+            return self.resolvedSource(for: storedAccount, snapshot: snapshot)
+        }
+
+        return .profileHome(path: path)
+    }
+
+    private static func resolvedSource(
+        for storedAccount: ManagedCodexAccount,
+        snapshot: CodexAccountReconciliationSnapshot) -> CodexActiveSource
+    {
+        self.matchesLiveSystemAccount(
+            storedAccount: storedAccount,
+            snapshot: snapshot,
+            liveSystemAccount: snapshot.liveSystemAccount) ? .liveSystem : .managedAccount(id: storedAccount.id)
+    }
+
     private static func matchesLiveSystemAccount(
         storedAccount: ManagedCodexAccount,
         snapshot: CodexAccountReconciliationSnapshot,
         liveSystemAccount: ObservedSystemCodexAccount?) -> Bool
     {
         guard let liveSystemAccount else { return false }
+        let liveIdentity = snapshot.runtimeIdentity(for: liveSystemAccount)
+        if storedAccount.effectiveWorkspaceAccountID != nil {
+            return CodexIdentityMatcher.matches(
+                snapshot.managedRemoteIdentity(for: storedAccount),
+                lhsEmail: snapshot.runtimeEmail(for: storedAccount),
+                liveIdentity,
+                rhsEmail: liveSystemAccount.email)
+        }
         if let storedFingerprint = storedAccount.authFingerprint,
            let liveFingerprint = liveSystemAccount.authFingerprint,
            storedFingerprint == liveFingerprint
@@ -51,7 +91,7 @@ public enum CodexActiveSourceResolver {
         return CodexIdentityMatcher.matches(
             snapshot.runtimeIdentity(for: storedAccount),
             lhsEmail: snapshot.runtimeEmail(for: storedAccount),
-            snapshot.runtimeIdentity(for: liveSystemAccount),
+            liveIdentity,
             rhsEmail: liveSystemAccount.email)
     }
 }
@@ -60,6 +100,8 @@ public struct CodexAccountReconciliationSnapshot: Equatable, Sendable {
     public let storedAccounts: [ManagedCodexAccount]
     public let activeStoredAccount: ManagedCodexAccount?
     public let liveSystemAccount: ObservedSystemCodexAccount?
+    public let profileHomeAccounts: [ObservedSystemCodexAccount]
+    public let profileHomePaths: [String]
     public let matchingStoredAccountForLiveSystemAccount: ManagedCodexAccount?
     public let activeSource: CodexActiveSource
     public let hasUnreadableAddedAccountStore: Bool
@@ -70,6 +112,8 @@ public struct CodexAccountReconciliationSnapshot: Equatable, Sendable {
         storedAccounts: [ManagedCodexAccount],
         activeStoredAccount: ManagedCodexAccount?,
         liveSystemAccount: ObservedSystemCodexAccount?,
+        profileHomeAccounts: [ObservedSystemCodexAccount] = [],
+        profileHomePaths: [String]? = nil,
         matchingStoredAccountForLiveSystemAccount: ManagedCodexAccount?,
         activeSource: CodexActiveSource,
         hasUnreadableAddedAccountStore: Bool,
@@ -79,6 +123,9 @@ public struct CodexAccountReconciliationSnapshot: Equatable, Sendable {
         self.storedAccounts = storedAccounts
         self.activeStoredAccount = activeStoredAccount
         self.liveSystemAccount = liveSystemAccount
+        self.profileHomeAccounts = Self.uniqueProfileHomeAccounts(profileHomeAccounts)
+        self.profileHomePaths = Self.uniqueNormalizedPaths(
+            profileHomePaths ?? profileHomeAccounts.map(\.codexHomePath))
         self.matchingStoredAccountForLiveSystemAccount = matchingStoredAccountForLiveSystemAccount
         self.activeSource = activeSource
         self.hasUnreadableAddedAccountStore = hasUnreadableAddedAccountStore
@@ -90,6 +137,8 @@ public struct CodexAccountReconciliationSnapshot: Equatable, Sendable {
         lhs.storedAccounts.map(AccountIdentity.init) == rhs.storedAccounts.map(AccountIdentity.init)
             && lhs.activeStoredAccount.map(AccountIdentity.init) == rhs.activeStoredAccount.map(AccountIdentity.init)
             && lhs.liveSystemAccount == rhs.liveSystemAccount
+            && lhs.profileHomeAccounts == rhs.profileHomeAccounts
+            && lhs.profileHomePaths == rhs.profileHomePaths
             && lhs.matchingStoredAccountForLiveSystemAccount.map(AccountIdentity.init)
             == rhs.matchingStoredAccountForLiveSystemAccount.map(AccountIdentity.init)
             && lhs.activeSource == rhs.activeSource
@@ -103,27 +152,74 @@ public struct CodexAccountReconciliationSnapshot: Equatable, Sendable {
             ?? CodexIdentityResolver.resolve(accountId: nil, email: storedAccount.email)
     }
 
+    public func managedRemoteIdentity(for storedAccount: ManagedCodexAccount) -> CodexIdentity {
+        if let workspaceAccountID = storedAccount.effectiveWorkspaceAccountID {
+            return .providerAccount(id: workspaceAccountID)
+        }
+        return self.runtimeIdentity(for: storedAccount)
+    }
+
     public func runtimeEmail(for storedAccount: ManagedCodexAccount) -> String {
         self.storedAccountRuntimeEmails[storedAccount.id]
             ?? Self.normalizeEmail(storedAccount.email)
     }
 
     public func runtimeIdentity(for liveSystemAccount: ObservedSystemCodexAccount) -> CodexIdentity {
-        CodexIdentityMatcher.normalized(
-            liveSystemAccount.identity,
-            fallbackEmail: liveSystemAccount.email)
+        CodexIdentityMatcher.normalized(liveSystemAccount)
+    }
+
+    public func profileHomeAccount(path: String) -> ObservedSystemCodexAccount? {
+        guard let normalizedPath = CodexHomeScope.normalizedHomePath(path) else { return nil }
+        return self.profileHomeAccounts.first {
+            CodexHomeScope.normalizedHomePath($0.codexHomePath) == normalizedPath
+        }
+    }
+
+    public func configuredProfileHomePath(path: String) -> String? {
+        guard let normalizedPath = CodexHomeScope.normalizedHomePath(path),
+              self.profileHomePaths.contains(normalizedPath)
+        else {
+            return nil
+        }
+        return normalizedPath
     }
 
     private static func normalizeEmail(_ email: String) -> String {
         email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
+
+    private static func uniqueProfileHomeAccounts(
+        _ accounts: [ObservedSystemCodexAccount]) -> [ObservedSystemCodexAccount]
+    {
+        var seenPaths: Set<String> = []
+        var result: [ObservedSystemCodexAccount] = []
+        for account in accounts {
+            let path = CodexHomeScope.normalizedHomePath(account.codexHomePath) ?? account.codexHomePath
+            guard seenPaths.insert(path).inserted else { continue }
+            result.append(account)
+        }
+        return result
+    }
+
+    private static func uniqueNormalizedPaths(_ paths: [String]) -> [String] {
+        var seen: Set<String> = []
+        return paths.compactMap { path in
+            guard let normalizedPath = CodexHomeScope.normalizedHomePath(path),
+                  seen.insert(normalizedPath).inserted
+            else {
+                return nil
+            }
+            return normalizedPath
+        }
+    }
 }
 
-public struct DefaultCodexAccountReconciler {
+public struct DefaultCodexAccountReconciler: Sendable {
     public let storeLoader: @Sendable () throws -> ManagedCodexAccountSet
     public let systemObserver: any CodexSystemAccountObserving
     public let activeSource: CodexActiveSource
     public let baseEnvironment: [String: String]
+    public let profileHomePaths: [String]
     public let managedEnvironmentBuilder: @Sendable ([String: String], ManagedCodexAccount) -> [String: String]
 
     public init(
@@ -133,6 +229,7 @@ public struct DefaultCodexAccountReconciler {
         systemObserver: any CodexSystemAccountObserving = DefaultCodexSystemAccountObserver(),
         activeSource: CodexActiveSource = .liveSystem,
         baseEnvironment: [String: String],
+        profileHomePaths: [String] = [],
         managedEnvironmentBuilder: @escaping @Sendable ([String: String], ManagedCodexAccount)
             -> [String: String] = { baseEnvironment, account in
                 CodexHomeScope.scopedEnvironment(base: baseEnvironment, codexHome: account.managedHomePath)
@@ -142,11 +239,13 @@ public struct DefaultCodexAccountReconciler {
         self.systemObserver = systemObserver
         self.activeSource = activeSource
         self.baseEnvironment = baseEnvironment
+        self.profileHomePaths = Self.uniqueNormalizedPaths(profileHomePaths)
         self.managedEnvironmentBuilder = managedEnvironmentBuilder
     }
 
     public func loadSnapshot() -> CodexAccountReconciliationSnapshot {
         let liveSystemAccount = self.loadLiveSystemAccount()
+        let profileHomeAccounts = self.loadProfileHomeAccounts(liveSystemAccount: liveSystemAccount)
 
         do {
             let accounts = try self.storeLoader()
@@ -157,24 +256,37 @@ public struct DefaultCodexAccountReconciler {
             let activeStoredAccount: ManagedCodexAccount? = switch self.activeSource {
             case let .managedAccount(id):
                 accounts.account(id: id)
-            case .liveSystem:
+            case .liveSystem, .profileHome:
                 nil
             }
             let matchingStoredAccountForLiveSystemAccount = liveSystemAccount.flatMap { liveAccount in
-                if let liveFingerprint = liveAccount.authFingerprint,
-                   let exactFingerprintMatch = accounts.accounts.first(where: {
-                       $0.authFingerprint == liveFingerprint
-                   })
-                {
-                    return exactFingerprintMatch
+                if let liveFingerprint = liveAccount.authFingerprint {
+                    let fingerprintMatches = accounts.accounts.filter { $0.authFingerprint == liveFingerprint }
+                    if let selectedWorkspaceMatch = fingerprintMatches.first(where: {
+                        guard $0.effectiveWorkspaceAccountID != nil,
+                              let runtimeAccount = runtimeAccounts[$0.id]
+                        else {
+                            return false
+                        }
+                        return self.managedAccount(
+                            $0,
+                            runtimeAccount: runtimeAccount,
+                            matchesLiveAccount: liveAccount)
+                    }) {
+                        return selectedWorkspaceMatch
+                    }
+                    if let legacyMatch = fingerprintMatches.first(where: {
+                        $0.effectiveWorkspaceAccountID == nil
+                    }) {
+                        return legacyMatch
+                    }
                 }
                 return accounts.accounts.first { account in
                     guard let runtimeAccount = runtimeAccounts[account.id] else { return false }
-                    return CodexIdentityMatcher.matches(
-                        runtimeAccount.identity,
-                        lhsEmail: runtimeAccount.email,
-                        self.runtimeIdentity(for: liveAccount),
-                        rhsEmail: liveAccount.email)
+                    return self.managedAccount(
+                        account,
+                        runtimeAccount: runtimeAccount,
+                        matchesLiveAccount: liveAccount)
                 }
             }
 
@@ -182,6 +294,10 @@ public struct DefaultCodexAccountReconciler {
                 storedAccounts: accounts.accounts,
                 activeStoredAccount: activeStoredAccount,
                 liveSystemAccount: liveSystemAccount,
+                profileHomeAccounts: self.profileHomeAccounts(
+                    profileHomeAccounts,
+                    excludingManagedAccounts: accounts.accounts),
+                profileHomePaths: self.profileHomePaths,
                 matchingStoredAccountForLiveSystemAccount: matchingStoredAccountForLiveSystemAccount,
                 activeSource: self.activeSource,
                 hasUnreadableAddedAccountStore: false,
@@ -192,10 +308,48 @@ public struct DefaultCodexAccountReconciler {
                 storedAccounts: [],
                 activeStoredAccount: nil,
                 liveSystemAccount: liveSystemAccount,
+                profileHomeAccounts: profileHomeAccounts,
+                profileHomePaths: self.profileHomePaths,
                 matchingStoredAccountForLiveSystemAccount: nil,
                 activeSource: self.activeSource,
                 hasUnreadableAddedAccountStore: true)
         }
+    }
+
+    private func loadProfileHomeAccounts(
+        liveSystemAccount: ObservedSystemCodexAccount?) -> [ObservedSystemCodexAccount]
+    {
+        let livePath = liveSystemAccount.flatMap { CodexHomeScope.normalizedHomePath($0.codexHomePath) }
+        return self.profileHomePaths.compactMap { path in
+            guard path != livePath else { return nil }
+            return self.loadProfileHomeAccount(homePath: path)
+        }
+    }
+
+    private func loadProfileHomeAccount(homePath: String) -> ObservedSystemCodexAccount? {
+        let environment = CodexHomeScope.scopedEnvironment(base: self.baseEnvironment, codexHome: homePath)
+        let account = UsageFetcher(environment: environment).loadAuthBackedCodexAccount()
+
+        guard let rawEmail = account.email?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !rawEmail.isEmpty
+        else {
+            return nil
+        }
+
+        let providerAccountID: String? = switch account.identity {
+        case let .providerAccount(id):
+            ManagedCodexAccount.normalizeProviderAccountID(id)
+        case .emailOnly, .unresolved:
+            nil
+        }
+
+        return ObservedSystemCodexAccount(
+            email: rawEmail.lowercased(),
+            workspaceAccountID: providerAccountID,
+            authFingerprint: CodexAuthFingerprint.fingerprint(homePath: homePath),
+            codexHomePath: homePath,
+            observedAt: Date(),
+            identity: account.identity)
     }
 
     private func loadLiveSystemAccount() -> ObservedSystemCodexAccount? {
@@ -235,22 +389,78 @@ public struct DefaultCodexAccountReconciler {
             identity: identity)
     }
 
+    private func managedAccount(
+        _ account: ManagedCodexAccount,
+        runtimeAccount: RuntimeManagedCodexAccount,
+        matchesLiveAccount liveAccount: ObservedSystemCodexAccount) -> Bool
+    {
+        let managedIdentity: CodexIdentity = if let workspaceAccountID = account.effectiveWorkspaceAccountID {
+            .providerAccount(id: workspaceAccountID)
+        } else {
+            runtimeAccount.identity
+        }
+        return CodexIdentityMatcher.matches(
+            managedIdentity,
+            lhsEmail: runtimeAccount.email,
+            self.runtimeIdentity(for: liveAccount),
+            rhsEmail: liveAccount.email)
+    }
+
+    private func profileHomeAccounts(
+        _ profileHomeAccounts: [ObservedSystemCodexAccount],
+        excludingManagedAccounts managedAccounts: [ManagedCodexAccount]) -> [ObservedSystemCodexAccount]
+    {
+        let managedPaths = Set(managedAccounts.compactMap { CodexHomeScope.normalizedHomePath($0.managedHomePath) })
+        return profileHomeAccounts.filter { account in
+            guard let path = CodexHomeScope.normalizedHomePath(account.codexHomePath) else { return false }
+            return !managedPaths.contains(path)
+        }
+    }
+
     private func runtimeIdentity(for liveSystemAccount: ObservedSystemCodexAccount) -> CodexIdentity {
-        CodexIdentityMatcher.normalized(
-            liveSystemAccount.identity,
-            fallbackEmail: liveSystemAccount.email)
+        CodexIdentityMatcher.normalized(liveSystemAccount)
+    }
+
+    private static func uniqueNormalizedPaths(_ paths: [String]) -> [String] {
+        var seen: Set<String> = []
+        var result: [String] = []
+        for path in paths.compactMap({ CodexHomeScope.normalizedHomePath($0) }) {
+            guard seen.insert(path).inserted else { continue }
+            result.append(path)
+        }
+        return result
     }
 }
 
 public enum CodexIdentityMatcher {
+    public static func normalized(_ liveSystemAccount: ObservedSystemCodexAccount) -> CodexIdentity {
+        let normalizedIdentity = self.normalized(
+            liveSystemAccount.identity,
+            fallbackEmail: liveSystemAccount.email)
+        if case .providerAccount = normalizedIdentity {
+            return normalizedIdentity
+        }
+        if let workspaceAccountID = ManagedCodexAccount.normalizeWorkspaceAccountID(
+            liveSystemAccount.workspaceAccountID)
+        {
+            return .providerAccount(id: workspaceAccountID)
+        }
+        return normalizedIdentity
+    }
+
     public static func matches(_ lhs: CodexIdentity, _ rhs: CodexIdentity) -> Bool {
         switch (lhs, rhs) {
         case let (.providerAccount(leftID), .providerAccount(rightID)):
-            leftID == rightID
+            guard let normalizedLeftID = ManagedCodexAccount.normalizeWorkspaceAccountID(leftID),
+                  let normalizedRightID = ManagedCodexAccount.normalizeWorkspaceAccountID(rightID)
+            else {
+                return false
+            }
+            return normalizedLeftID == normalizedRightID
         case let (.emailOnly(leftEmail), .emailOnly(rightEmail)):
-            leftEmail == rightEmail
+            return leftEmail == rightEmail
         default:
-            false
+            return false
         }
     }
 
@@ -272,8 +482,9 @@ public enum CodexIdentityMatcher {
 
     public static func normalized(_ identity: CodexIdentity, fallbackEmail: String) -> CodexIdentity {
         switch identity {
-        case .providerAccount:
-            identity
+        case let .providerAccount(id):
+            ManagedCodexAccount.normalizeWorkspaceAccountID(id).map { .providerAccount(id: $0) }
+                ?? .unresolved
         case let .emailOnly(normalizedEmail):
             CodexIdentityResolver.resolve(accountId: nil, email: normalizedEmail)
         case .unresolved:

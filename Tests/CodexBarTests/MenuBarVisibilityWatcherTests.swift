@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 import Testing
 @testable import CodexBar
@@ -61,6 +62,88 @@ struct MenuBarVisibilityWatcherTests {
             buttonWidth: 18)
 
         #expect(!MenuBarVisibilityWatcher.isBlockedSnapshot(snapshot: snapshot))
+    }
+
+    @Test
+    func `window probe matches autosave name and reports display bounds`() {
+        let snapshots = MenuBarStatusItemWindowProbe.snapshots(
+            matching: ["codexbar-merged"],
+            windowInfo: [[
+                kCGWindowName as String: "codexbar-merged",
+                kCGWindowOwnerName as String: "Control Center",
+                kCGWindowIsOnscreen as String: true,
+                kCGWindowBounds as String: [
+                    "X": 1680,
+                    "Y": 0,
+                    "Width": 70,
+                    "Height": 24,
+                ],
+            ]],
+            displayBounds: [CGRect(x: 0, y: 0, width: 2056, height: 1329)])
+
+        #expect(snapshots.count == 1)
+        #expect(snapshots.first?.name == "codexbar-merged")
+        #expect(snapshots.first?.ownerName == "Control Center")
+        #expect(snapshots.first?.isOnscreen == true)
+        #expect(snapshots.first?.isWithinDisplayBounds == true)
+    }
+
+    @Test
+    func `window probe detects offscreen status item by bounds`() {
+        let snapshots = MenuBarStatusItemWindowProbe.snapshots(
+            matching: ["codexbar-merged"],
+            windowInfo: [[
+                kCGWindowName as String: "codexbar-merged",
+                kCGWindowOwnerName as String: "Control Center",
+                kCGWindowIsOnscreen as String: true,
+                kCGWindowBounds as String: [
+                    "X": 2023,
+                    "Y": 0,
+                    "Width": 71,
+                    "Height": 24,
+                ],
+            ]],
+            displayBounds: [CGRect(x: 0, y: 0, width: 2056, height: 1329)])
+
+        #expect(snapshots.count == 1)
+        #expect(snapshots.first?.isOnscreen == true)
+        #expect(snapshots.first?.isWithinDisplayBounds == false)
+    }
+
+    @Test
+    func `window probe identifies Tahoe Control Center blocked proxy geometry`() {
+        let snapshot = MenuBarStatusItemWindowSnapshot(
+            name: "codexbar-merged",
+            ownerName: "Control Center",
+            bounds: CGRect(x: 0, y: -22, width: 76, height: 22),
+            isOnscreen: true,
+            displayBounds: nil)
+
+        #expect(snapshot.isTahoeBlockedProxy)
+    }
+
+    @Test
+    func `window probe does not classify generic offscreen manager placement as Tahoe proxy`() {
+        let snapshot = MenuBarStatusItemWindowSnapshot(
+            name: "codexbar-merged",
+            ownerName: "Control Center",
+            bounds: CGRect(x: 2023, y: 0, width: 71, height: 24),
+            isOnscreen: true,
+            displayBounds: nil)
+
+        #expect(!snapshot.isTahoeBlockedProxy)
+    }
+
+    @Test
+    func `window probe does not classify stale hidden Control Center record as Tahoe proxy`() {
+        let snapshot = MenuBarStatusItemWindowSnapshot(
+            name: "codexbar-merged",
+            ownerName: "Control Center",
+            bounds: CGRect(x: 0, y: -22, width: 76, height: 22),
+            isOnscreen: false,
+            displayBounds: nil)
+
+        #expect(!snapshot.isTahoeBlockedProxy)
     }
 
     @Test
@@ -136,6 +219,207 @@ struct MenuBarVisibilityWatcherTests {
             appLaunchedAt: launchedAt,
             now: launchedAt.addingTimeInterval(2),
             snapshots: [blocked]))
+    }
+
+    @Test
+    func `startup recovery retries detached Tahoe proxy corroborated by Control Center geometry`() {
+        let launchedAt = Date(timeIntervalSince1970: 1000)
+        let detachedProxy = StatusItemVisibilitySnapshot(
+            isVisible: true,
+            hasButton: true,
+            hasWindow: true,
+            hasScreen: false,
+            isOnCurrentScreen: false,
+            buttonWidth: 76)
+        let blockedWindow = MenuBarStatusItemWindowSnapshot(
+            name: "codexbar-merged",
+            ownerName: "Control Center",
+            bounds: CGRect(x: 0, y: -22, width: 76, height: 22),
+            isOnscreen: true,
+            displayBounds: nil)
+
+        #expect(!MenuBarVisibilityWatcher.isBlockedSnapshot(snapshot: detachedProxy))
+        #expect(MenuBarVisibilityWatcher.shouldAttemptStartupRecovery(
+            appLaunchedAt: launchedAt,
+            now: launchedAt.addingTimeInterval(2),
+            snapshots: [detachedProxy],
+            windowSnapshots: [blockedWindow],
+            detectTahoeBlockedStatusItem: true))
+    }
+
+    @Test
+    func `startup recovery retries expected hidden Tahoe item with enabled default and no window`() {
+        let launchedAt = Date(timeIntervalSince1970: 1000)
+        let hidden = StatusItemVisibilitySnapshot(
+            isVisible: false,
+            hasButton: true,
+            hasWindow: false,
+            hasScreen: false,
+            buttonWidth: 76)
+        let evidence = StatusItemStartupVisibilityEvidence(
+            autosaveName: "codexbar-merged",
+            expectsVisibility: true,
+            visibilityDefault: true,
+            snapshot: hidden)
+
+        #expect(MenuBarVisibilityWatcher.shouldAttemptStartupRecovery(
+            appLaunchedAt: launchedAt,
+            now: launchedAt.addingTimeInterval(2),
+            snapshots: [hidden],
+            evidence: [evidence],
+            detectTahoeBlockedStatusItem: true))
+    }
+
+    @Test
+    func `startup recovery ignores hidden Tahoe item without app and defaults visibility agreement`() {
+        let launchedAt = Date(timeIntervalSince1970: 1000)
+        let hidden = StatusItemVisibilitySnapshot(
+            isVisible: false,
+            hasButton: true,
+            hasWindow: false,
+            hasScreen: false,
+            buttonWidth: 76)
+        let intentionallyHidden = StatusItemStartupVisibilityEvidence(
+            autosaveName: "codexbar-merged",
+            expectsVisibility: false,
+            visibilityDefault: true,
+            snapshot: hidden)
+        let disabledByUser = StatusItemStartupVisibilityEvidence(
+            autosaveName: "codexbar-merged",
+            expectsVisibility: true,
+            visibilityDefault: false,
+            snapshot: hidden)
+        let unknownDefault = StatusItemStartupVisibilityEvidence(
+            autosaveName: "codexbar-merged",
+            expectsVisibility: true,
+            visibilityDefault: nil,
+            snapshot: hidden)
+
+        for evidence in [intentionallyHidden, disabledByUser, unknownDefault] {
+            #expect(!MenuBarVisibilityWatcher.shouldAttemptStartupRecovery(
+                appLaunchedAt: launchedAt,
+                now: launchedAt.addingTimeInterval(2),
+                snapshots: [hidden],
+                evidence: [evidence],
+                detectTahoeBlockedStatusItem: true))
+        }
+    }
+
+    @Test
+    func `startup recovery ignores hidden item when matching window still exists`() {
+        let launchedAt = Date(timeIntervalSince1970: 1000)
+        let hidden = StatusItemVisibilitySnapshot(
+            isVisible: false,
+            hasButton: true,
+            hasWindow: false,
+            hasScreen: false,
+            buttonWidth: 76)
+        let evidence = StatusItemStartupVisibilityEvidence(
+            autosaveName: "codexbar-merged",
+            expectsVisibility: true,
+            visibilityDefault: true,
+            snapshot: hidden)
+        let existingWindow = MenuBarStatusItemWindowSnapshot(
+            name: "codexbar-merged",
+            ownerName: "Control Center",
+            bounds: CGRect(x: 1500, y: 0, width: 76, height: 24),
+            isOnscreen: true,
+            displayBounds: CGRect(x: 0, y: 0, width: 2056, height: 1329))
+
+        #expect(!MenuBarVisibilityWatcher.shouldAttemptStartupRecovery(
+            appLaunchedAt: launchedAt,
+            now: launchedAt.addingTimeInterval(2),
+            snapshots: [hidden],
+            evidence: [evidence],
+            windowSnapshots: [existingWindow],
+            detectTahoeBlockedStatusItem: true))
+    }
+
+    @Test
+    func `startup recovery ignores stale hidden matching window record`() {
+        let launchedAt = Date(timeIntervalSince1970: 1000)
+        let hidden = StatusItemVisibilitySnapshot(
+            isVisible: false,
+            hasButton: true,
+            hasWindow: false,
+            hasScreen: false,
+            buttonWidth: 76)
+        let evidence = StatusItemStartupVisibilityEvidence(
+            autosaveName: "codexbar-merged",
+            expectsVisibility: true,
+            visibilityDefault: true,
+            snapshot: hidden)
+        let staleWindow = MenuBarStatusItemWindowSnapshot(
+            name: "codexbar-merged",
+            ownerName: "Control Center",
+            bounds: CGRect(x: 1500, y: 0, width: 76, height: 24),
+            isOnscreen: false,
+            displayBounds: CGRect(x: 0, y: 0, width: 2056, height: 1329))
+
+        #expect(MenuBarVisibilityWatcher.shouldAttemptStartupRecovery(
+            appLaunchedAt: launchedAt,
+            now: launchedAt.addingTimeInterval(2),
+            snapshots: [hidden],
+            evidence: [evidence],
+            windowSnapshots: [staleWindow],
+            detectTahoeBlockedStatusItem: true))
+    }
+
+    @Test
+    func `startup recovery keeps hidden no-window detection Tahoe only`() {
+        let launchedAt = Date(timeIntervalSince1970: 1000)
+        let hidden = StatusItemVisibilitySnapshot(
+            isVisible: false,
+            hasButton: true,
+            hasWindow: false,
+            hasScreen: false,
+            buttonWidth: 76)
+        let evidence = StatusItemStartupVisibilityEvidence(
+            autosaveName: "codexbar-merged",
+            expectsVisibility: true,
+            visibilityDefault: true,
+            snapshot: hidden)
+
+        #expect(!MenuBarVisibilityWatcher.shouldAttemptStartupRecovery(
+            appLaunchedAt: launchedAt,
+            now: launchedAt.addingTimeInterval(2),
+            snapshots: [hidden],
+            evidence: [evidence]))
+    }
+
+    @Test
+    func `startup recovery ignores detached live item without Tahoe proxy corroboration`() {
+        let launchedAt = Date(timeIntervalSince1970: 1000)
+        let managed = StatusItemVisibilitySnapshot(
+            isVisible: true,
+            hasButton: true,
+            hasWindow: true,
+            hasScreen: false,
+            isOnCurrentScreen: false,
+            buttonWidth: 18)
+
+        #expect(!MenuBarVisibilityWatcher.shouldAttemptStartupRecovery(
+            appLaunchedAt: launchedAt,
+            now: launchedAt.addingTimeInterval(2),
+            snapshots: [managed],
+            detectTahoeBlockedStatusItem: true))
+    }
+
+    @Test
+    func `startup recovery ignores live item attached to a stale screen`() {
+        let launchedAt = Date(timeIntervalSince1970: 1000)
+        let managed = StatusItemVisibilitySnapshot(
+            isVisible: true,
+            hasButton: true,
+            hasWindow: true,
+            hasScreen: true,
+            isOnCurrentScreen: false,
+            buttonWidth: 18)
+
+        #expect(!MenuBarVisibilityWatcher.shouldAttemptStartupRecovery(
+            appLaunchedAt: launchedAt,
+            now: launchedAt.addingTimeInterval(2),
+            snapshots: [managed]))
     }
 
     @Test
@@ -298,8 +582,11 @@ struct MenuBarVisibilityWatcherTests {
     }
 
     @Test
-    func `screen change retry ignores detached screen with live status item`() {
-        let blocked = StatusItemVisibilitySnapshot(
+    func `manager parked item with live window is not blocked`() {
+        // A menu bar manager parks items off the active screen with the window intact.
+        // hasAnyBlockedVisibleSnapshot must return false so verifyScreenChangeRecoveryIfNeeded
+        // does not trigger repeated recreation that corrupts Control Center.
+        let managed = StatusItemVisibilitySnapshot(
             isVisible: true,
             hasButton: true,
             hasWindow: true,
@@ -307,52 +594,37 @@ struct MenuBarVisibilityWatcherTests {
             isOnCurrentScreen: false,
             buttonWidth: 18)
 
-        #expect(!MenuBarVisibilityWatcher.shouldRetryScreenChangeRecovery(
-            attempt: MenuBarVisibilityWatcher.screenChangeRecoveryRetryLimit - 1,
-            snapshots: [blocked]))
+        #expect(!MenuBarVisibilityWatcher.hasAnyBlockedVisibleSnapshot([managed]))
+        #expect(MenuBarVisibilityWatcher.hasAnyDisplacedVisibleSnapshot([managed]))
     }
 
     @Test
-    func `screen change retry continues for missing window before retry limit`() {
-        let blocked = StatusItemVisibilitySnapshot(
-            isVisible: true,
-            hasButton: true,
-            hasWindow: false,
-            hasScreen: false,
-            isOnCurrentScreen: false,
-            buttonWidth: 18)
-
-        #expect(MenuBarVisibilityWatcher.shouldRetryScreenChangeRecovery(
-            attempt: MenuBarVisibilityWatcher.screenChangeRecoveryRetryLimit - 1,
-            snapshots: [blocked]))
-    }
-
-    @Test
-    func `screen change retry stops at retry limit for missing window`() {
-        let blocked = StatusItemVisibilitySnapshot(
-            isVisible: true,
-            hasButton: true,
-            hasWindow: false,
-            hasScreen: false,
-            isOnCurrentScreen: false,
-            buttonWidth: 18)
-
-        #expect(!MenuBarVisibilityWatcher.shouldRetryScreenChangeRecovery(
-            attempt: MenuBarVisibilityWatcher.screenChangeRecoveryRetryLimit,
-            snapshots: [blocked]))
-    }
-
-    @Test
-    func `screen change retry stops when recovered`() {
-        let healthy = StatusItemVisibilitySnapshot(
+    func `manager parked item with live window on stale screen is not blocked`() {
+        let managed = StatusItemVisibilitySnapshot(
             isVisible: true,
             hasButton: true,
             hasWindow: true,
             hasScreen: true,
+            isOnCurrentScreen: false,
             buttonWidth: 18)
 
-        #expect(!MenuBarVisibilityWatcher.shouldRetryScreenChangeRecovery(
-            attempt: 1,
-            snapshots: [healthy]))
+        #expect(!MenuBarVisibilityWatcher.hasAnyBlockedVisibleSnapshot([managed]))
+        #expect(MenuBarVisibilityWatcher.hasAnyDisplacedVisibleSnapshot([managed]))
+    }
+
+    @Test
+    func `item without window is blocked regardless of screen state`() {
+        // A missing window cannot be caused by a manager parking the item; it signals
+        // a genuine system block and must trigger recovery.
+        let blocked = StatusItemVisibilitySnapshot(
+            isVisible: true,
+            hasButton: true,
+            hasWindow: false,
+            hasScreen: false,
+            isOnCurrentScreen: false,
+            buttonWidth: 18)
+
+        #expect(MenuBarVisibilityWatcher.hasAnyBlockedVisibleSnapshot([blocked]))
+        #expect(!MenuBarVisibilityWatcher.hasAnyDisplacedVisibleSnapshot([blocked]))
     }
 }

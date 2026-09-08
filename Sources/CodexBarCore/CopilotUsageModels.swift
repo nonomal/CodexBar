@@ -19,9 +19,13 @@ public struct CopilotUsageResponse: Sendable, Decodable {
     public struct QuotaSnapshot: Sendable, Decodable {
         public let entitlement: Double
         public let remaining: Double
+        public let creditsUsed: Double?
         public let percentRemaining: Double
         public let quotaId: String
         public let hasPercentRemaining: Bool
+        public let unlimited: Bool
+        private let entitlementWasDecoded: Bool
+        private let remainingWasDecoded: Bool
         public var usedPercent: Double {
             max(0, 100 - self.percentRemaining)
         }
@@ -31,14 +35,41 @@ public struct CopilotUsageResponse: Sendable, Decodable {
         }
 
         public var isPlaceholder: Bool {
-            self.entitlement == 0 && self.remaining == 0 && self.percentRemaining == 0 && self.quotaId.isEmpty
+            if self.unlimited {
+                return false
+            }
+
+            if self.entitlement == 0,
+               self.remaining == 0,
+               self.percentRemaining == 0,
+               !self.hasPercentRemaining
+            {
+                return true
+            }
+
+            // An explicit zero-entitlement, zero-remaining snapshot carries no usable quota signal.
+            // GitHub returns this shape for token-based billing / Copilot Business seats,
+            // sometimes as percent_remaining=100 with a non-empty quota_id, which would
+            // otherwise render as a misleading "0% used" (100 - 100). Treat it as a
+            // placeholder so the usual handling drops it instead of showing fake usage.
+            return self.entitlementWasDecoded && self.remainingWasDecoded && self.entitlement == 0 && self
+                .remaining == 0
+        }
+
+        /// Whether the snapshot carries a real absolute credit counter, even when
+        /// it lacks a usable percentage window. Such snapshots stay accessible in
+        /// the decoded response without ever becoming a fake percentage bar.
+        public var carriesCreditsCounter: Bool {
+            self.creditsUsed != nil
         }
 
         private enum CodingKeys: String, CodingKey {
             case entitlement
             case remaining
+            case creditsUsed = "credits_used"
             case percentRemaining = "percent_remaining"
             case quotaId = "quota_id"
+            case unlimited
         }
 
         public init(
@@ -46,13 +77,19 @@ public struct CopilotUsageResponse: Sendable, Decodable {
             remaining: Double,
             percentRemaining: Double,
             quotaId: String,
-            hasPercentRemaining: Bool = true)
+            creditsUsed: Double? = nil,
+            hasPercentRemaining: Bool = true,
+            unlimited: Bool = false)
         {
             self.entitlement = entitlement
             self.remaining = remaining
-            self.percentRemaining = percentRemaining
+            self.creditsUsed = creditsUsed
+            self.percentRemaining = unlimited ? 100 : percentRemaining
             self.quotaId = quotaId
-            self.hasPercentRemaining = hasPercentRemaining
+            self.hasPercentRemaining = unlimited || hasPercentRemaining
+            self.unlimited = unlimited
+            self.entitlementWasDecoded = true
+            self.remainingWasDecoded = true
         }
 
         public init(from decoder: any Decoder) throws {
@@ -61,8 +98,15 @@ public struct CopilotUsageResponse: Sendable, Decodable {
             let decodedRemaining = Self.decodeNumberIfPresent(container: container, key: .remaining)
             self.entitlement = decodedEntitlement ?? 0
             self.remaining = decodedRemaining ?? 0
+            self.entitlementWasDecoded = decodedEntitlement != nil
+            self.remainingWasDecoded = decodedRemaining != nil
+            self.creditsUsed = Self.decodeNumberIfPresent(container: container, key: .creditsUsed)
+            let decodedUnlimited = try container.decodeIfPresent(Bool.self, forKey: .unlimited) ?? false
             let decodedPercent = Self.decodeNumberIfPresent(container: container, key: .percentRemaining)
-            if let decodedPercent {
+            if decodedUnlimited {
+                self.percentRemaining = 100
+                self.hasPercentRemaining = true
+            } else if let decodedPercent {
                 self.percentRemaining = decodedPercent
                 self.hasPercentRemaining = true
             } else if let entitlement = decodedEntitlement,
@@ -78,6 +122,44 @@ public struct CopilotUsageResponse: Sendable, Decodable {
                 self.hasPercentRemaining = false
             }
             self.quotaId = try container.decodeIfPresent(String.self, forKey: .quotaId) ?? ""
+            self.unlimited = decodedUnlimited
+        }
+
+        private init(
+            entitlement: Double,
+            remaining: Double,
+            creditsUsed: Double?,
+            percentRemaining: Double,
+            quotaId: String,
+            hasPercentRemaining: Bool,
+            unlimited: Bool,
+            entitlementWasDecoded: Bool,
+            remainingWasDecoded: Bool)
+        {
+            self.entitlement = entitlement
+            self.remaining = remaining
+            self.creditsUsed = creditsUsed
+            self.percentRemaining = percentRemaining
+            self.quotaId = quotaId
+            self.hasPercentRemaining = hasPercentRemaining
+            self.unlimited = unlimited
+            self.entitlementWasDecoded = entitlementWasDecoded
+            self.remainingWasDecoded = remainingWasDecoded
+        }
+
+        /// Returns a copy carrying `creditsUsed`, preserving the decoded-flag
+        /// semantics that placeholder classification depends on.
+        fileprivate func withCreditsUsed(_ creditsUsed: Double?) -> QuotaSnapshot {
+            QuotaSnapshot(
+                entitlement: self.entitlement,
+                remaining: self.remaining,
+                creditsUsed: creditsUsed,
+                percentRemaining: self.percentRemaining,
+                quotaId: self.quotaId,
+                hasPercentRemaining: self.hasPercentRemaining,
+                unlimited: self.unlimited,
+                entitlementWasDecoded: self.entitlementWasDecoded,
+                remainingWasDecoded: self.remainingWasDecoded)
         }
 
         private static func decodeNumberIfPresent(
@@ -152,10 +234,10 @@ public struct CopilotUsageResponse: Sendable, Decodable {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             var premium = try container.decodeIfPresent(QuotaSnapshot.self, forKey: .premiumInteractions)
             var chat = try container.decodeIfPresent(QuotaSnapshot.self, forKey: .chat)
-            if premium?.isPlaceholder == true {
+            if premium?.isPlaceholder == true, premium?.carriesCreditsCounter != true {
                 premium = nil
             }
-            if chat?.isPlaceholder == true {
+            if chat?.isPlaceholder == true, chat?.carriesCreditsCounter != true {
                 chat = nil
             }
 
@@ -171,7 +253,7 @@ public struct CopilotUsageResponse: Sendable, Decodable {
                         guard let decoded = try dynamic.decodeIfPresent(QuotaSnapshot.self, forKey: key) else {
                             continue
                         }
-                        guard !decoded.isPlaceholder else { continue }
+                        guard !decoded.isPlaceholder || decoded.carriesCreditsCounter else { continue }
                         value = decoded
                     } catch {
                         continue
@@ -213,12 +295,14 @@ public struct CopilotUsageResponse: Sendable, Decodable {
 
     public let quotaSnapshots: QuotaSnapshots
     public let copilotPlan: String
+    public let tokenBasedBilling: Bool
     public let assignedDate: String?
     public let quotaResetDate: String?
 
     private enum CodingKeys: String, CodingKey {
         case quotaSnapshots = "quota_snapshots"
         case copilotPlan = "copilot_plan"
+        case tokenBasedBilling = "token_based_billing"
         case assignedDate = "assigned_date"
         case quotaResetDate = "quota_reset_date"
         case monthlyQuotas = "monthly_quotas"
@@ -228,11 +312,13 @@ public struct CopilotUsageResponse: Sendable, Decodable {
     public init(
         quotaSnapshots: QuotaSnapshots,
         copilotPlan: String,
+        tokenBasedBilling: Bool = false,
         assignedDate: String?,
         quotaResetDate: String?)
     {
         self.quotaSnapshots = quotaSnapshots
         self.copilotPlan = copilotPlan
+        self.tokenBasedBilling = tokenBasedBilling
         self.assignedDate = assignedDate
         self.quotaResetDate = quotaResetDate
     }
@@ -243,16 +329,19 @@ public struct CopilotUsageResponse: Sendable, Decodable {
         let monthlyQuotas = try container.decodeIfPresent(QuotaCounts.self, forKey: .monthlyQuotas)
         let limitedUserQuotas = try container.decodeIfPresent(QuotaCounts.self, forKey: .limitedUserQuotas)
         let monthlyLimitedSnapshots = Self.makeQuotaSnapshots(monthly: monthlyQuotas, limited: limitedUserQuotas)
-        let premium = Self.usableQuotaSnapshot(from: directSnapshots?.premiumInteractions) ??
-            Self.usableQuotaSnapshot(from: monthlyLimitedSnapshots?.premiumInteractions)
-        let chat = Self.usableQuotaSnapshot(from: directSnapshots?.chat) ??
-            Self.usableQuotaSnapshot(from: monthlyLimitedSnapshots?.chat)
+        let premium = Self.preferredQuotaSnapshot(
+            direct: directSnapshots?.premiumInteractions,
+            fallback: monthlyLimitedSnapshots?.premiumInteractions)
+        let chat = Self.preferredQuotaSnapshot(
+            direct: directSnapshots?.chat,
+            fallback: monthlyLimitedSnapshots?.chat)
         if premium != nil || chat != nil {
             self.quotaSnapshots = QuotaSnapshots(premiumInteractions: premium, chat: chat)
         } else {
             self.quotaSnapshots = directSnapshots ?? QuotaSnapshots(premiumInteractions: nil, chat: nil)
         }
         self.copilotPlan = try container.decodeIfPresent(String.self, forKey: .copilotPlan) ?? "unknown"
+        self.tokenBasedBilling = try container.decodeIfPresent(Bool.self, forKey: .tokenBasedBilling) ?? false
         self.assignedDate = try container.decodeIfPresent(String.self, forKey: .assignedDate)
         self.quotaResetDate = try container.decodeIfPresent(String.self, forKey: .quotaResetDate)
     }
@@ -301,5 +390,29 @@ public struct CopilotUsageResponse: Sendable, Decodable {
             return nil
         }
         return snapshot
+    }
+
+    private static func preferredQuotaSnapshot(
+        direct: QuotaSnapshot?,
+        fallback: QuotaSnapshot?) -> QuotaSnapshot?
+    {
+        if direct?.unlimited == true, let fallback = usableQuotaSnapshot(from: fallback) {
+            // The direct snapshot's absolute credit counter is real consumption
+            // even though its unlimited marker makes it ineligible for a
+            // percentage window; keep the counter on the selected fallback.
+            return fallback.withCreditsUsed(direct?.creditsUsed)
+        }
+        if let directWindow = self.usableQuotaSnapshot(from: direct) {
+            return directWindow
+        }
+        guard let fallback = self.usableQuotaSnapshot(from: fallback) else {
+            return nil
+        }
+        // A zero-entitlement placeholder can still carry a real absolute
+        // counter; keep it on the selected fallback instead of dropping it.
+        if direct?.carriesCreditsCounter == true {
+            return fallback.withCreditsUsed(direct?.creditsUsed)
+        }
+        return fallback
     }
 }

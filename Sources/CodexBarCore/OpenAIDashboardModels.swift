@@ -13,8 +13,14 @@ public struct OpenAIDashboardSnapshot: Codable, Equatable, Sendable {
     public let creditsPurchaseURL: String?
     public let primaryLimit: RateWindow?
     public let secondaryLimit: RateWindow?
+    /// Named model-specific limits (e.g. Codex Spark) decoded from the dashboard
+    /// `wham/usage` response's `additional_rate_limits` array.
+    public let extraRateWindows: [NamedRateWindow]?
     public let creditsRemaining: Double?
+    public let codexCreditLimit: CodexCreditLimitSnapshot?
     public let accountPlan: String?
+    public let subscriptionExpiresAt: Date?
+    public let subscriptionRenewsAt: Date?
     public let updatedAt: Date
 
     public init(
@@ -27,8 +33,12 @@ public struct OpenAIDashboardSnapshot: Codable, Equatable, Sendable {
         creditsPurchaseURL: String?,
         primaryLimit: RateWindow? = nil,
         secondaryLimit: RateWindow? = nil,
+        extraRateWindows: [NamedRateWindow]? = nil,
         creditsRemaining: Double? = nil,
+        codexCreditLimit: CodexCreditLimitSnapshot? = nil,
         accountPlan: String? = nil,
+        subscriptionExpiresAt: Date? = nil,
+        subscriptionRenewsAt: Date? = nil,
         updatedAt: Date)
     {
         self.signedInEmail = signedInEmail
@@ -40,8 +50,12 @@ public struct OpenAIDashboardSnapshot: Codable, Equatable, Sendable {
         self.creditsPurchaseURL = creditsPurchaseURL
         self.primaryLimit = primaryLimit
         self.secondaryLimit = secondaryLimit
+        self.extraRateWindows = extraRateWindows
         self.creditsRemaining = creditsRemaining
+        self.codexCreditLimit = codexCreditLimit
         self.accountPlan = accountPlan
+        self.subscriptionExpiresAt = subscriptionExpiresAt
+        self.subscriptionRenewsAt = subscriptionRenewsAt
         self.updatedAt = updatedAt
     }
 
@@ -55,8 +69,12 @@ public struct OpenAIDashboardSnapshot: Codable, Equatable, Sendable {
         case creditsPurchaseURL
         case primaryLimit
         case secondaryLimit
+        case extraRateWindows
         case creditsRemaining
+        case codexCreditLimit
         case accountPlan
+        case subscriptionExpiresAt
+        case subscriptionRenewsAt
         case updatedAt
     }
 
@@ -80,8 +98,15 @@ public struct OpenAIDashboardSnapshot: Codable, Equatable, Sendable {
         self.creditsPurchaseURL = try container.decodeIfPresent(String.self, forKey: .creditsPurchaseURL)
         self.primaryLimit = try container.decodeIfPresent(RateWindow.self, forKey: .primaryLimit)
         self.secondaryLimit = try container.decodeIfPresent(RateWindow.self, forKey: .secondaryLimit)
+        // Backward-compatible: older cached snapshots simply lack the key and decode to nil.
+        self.extraRateWindows = try container.decodeIfPresent(
+            [NamedRateWindow].self,
+            forKey: .extraRateWindows)
         self.creditsRemaining = try container.decodeIfPresent(Double.self, forKey: .creditsRemaining)
+        self.codexCreditLimit = try container.decodeIfPresent(CodexCreditLimitSnapshot.self, forKey: .codexCreditLimit)
         self.accountPlan = try container.decodeIfPresent(String.self, forKey: .accountPlan)
+        self.subscriptionExpiresAt = try container.decodeIfPresent(Date.self, forKey: .subscriptionExpiresAt)
+        self.subscriptionRenewsAt = try container.decodeIfPresent(Date.self, forKey: .subscriptionRenewsAt)
         self.updatedAt = try container.decode(Date.self, forKey: .updatedAt)
     }
 
@@ -114,6 +139,26 @@ public struct OpenAIDashboardSnapshot: Codable, Equatable, Sendable {
             return OpenAIDashboardDailyBreakdown(day: day, services: services, totalCreditsUsed: total)
         }
     }
+
+    public func withSubscriptionMetadata(_ metadata: OpenAISubscriptionMetadata?) -> Self {
+        Self(
+            signedInEmail: self.signedInEmail,
+            codeReviewRemainingPercent: self.codeReviewRemainingPercent,
+            codeReviewLimit: self.codeReviewLimit,
+            creditEvents: self.creditEvents,
+            dailyBreakdown: self.dailyBreakdown,
+            usageBreakdown: self.usageBreakdown,
+            creditsPurchaseURL: self.creditsPurchaseURL,
+            primaryLimit: self.primaryLimit,
+            secondaryLimit: self.secondaryLimit,
+            extraRateWindows: self.extraRateWindows,
+            creditsRemaining: self.creditsRemaining,
+            codexCreditLimit: self.codexCreditLimit,
+            accountPlan: self.accountPlan,
+            subscriptionExpiresAt: metadata?.expiresAt,
+            subscriptionRenewsAt: metadata?.renewsAt,
+            updatedAt: self.updatedAt)
+    }
 }
 
 extension OpenAIDashboardSnapshot {
@@ -131,8 +176,14 @@ extension OpenAIDashboardSnapshot {
     }
 
     public func toCreditsSnapshot() -> CreditsSnapshot? {
-        guard let creditsRemaining else { return nil }
-        return CreditsSnapshot(remaining: creditsRemaining, events: self.creditEvents, updatedAt: self.updatedAt)
+        guard self.creditsRemaining != nil || self.codexCreditLimit != nil else { return nil }
+        return CreditsSnapshot(
+            remaining: self.creditsRemaining ?? 0,
+            events: self.creditEvents,
+            updatedAt: self.updatedAt,
+            codexCreditLimit: self.codexCreditLimit,
+            // A cap-only dashboard read omits the balance entirely; that placeholder zero is unread, not spent.
+            balanceReadSucceeded: self.creditsRemaining != nil)
     }
 }
 
@@ -174,6 +225,114 @@ public struct OpenAIDashboardDailyBreakdown: Codable, Equatable, Sendable {
                 totalCreditsUsed: total)
         }
     }
+
+    public static func recentUsageSummary(
+        from breakdown: [OpenAIDashboardDailyBreakdown],
+        historyDays: Int = 30,
+        now: Date = Date(),
+        calendar: Calendar = .current) -> OpenAIDashboardUsageBreakdownSummary
+    {
+        let days = max(1, min(historyDays, 365))
+        var dayCalendar = Calendar(identifier: .gregorian)
+        dayCalendar.timeZone = calendar.timeZone
+        let today = dayCalendar.startOfDay(for: now)
+        let start = dayCalendar.date(byAdding: .day, value: -(days - 1), to: today) ?? today
+        let startKey = Self.dayKey(from: start, calendar: dayCalendar)
+        let todayKey = Self.dayKey(from: today, calendar: dayCalendar)
+        let recent = self.removingSkillUsageServices(from: breakdown)
+            .compactMap { self.sanitized($0, startKey: startKey, todayKey: todayKey, calendar: dayCalendar) }
+            .sorted { $0.day < $1.day }
+        let todayCredits = recent.first(where: { $0.day == todayKey })?.totalCreditsUsed
+            ?? (recent.isEmpty ? nil : 0)
+        let totalCredits = self.finiteSum(recent.map(\.totalCreditsUsed))
+        return OpenAIDashboardUsageBreakdownSummary(
+            historyDays: days,
+            todayCredits: todayCredits,
+            totalCredits: totalCredits,
+            daily: recent)
+    }
+
+    private static func sanitized(
+        _ day: OpenAIDashboardDailyBreakdown,
+        startKey: String,
+        todayKey: String,
+        calendar: Calendar) -> OpenAIDashboardDailyBreakdown?
+    {
+        guard self.date(fromDayKey: day.day, calendar: calendar) != nil,
+              day.day >= startKey,
+              day.day <= todayKey
+        else { return nil }
+
+        if day.services.isEmpty {
+            guard day.totalCreditsUsed.isFinite, day.totalCreditsUsed > 0 else { return nil }
+            return day
+        }
+
+        let services = day.services.filter { $0.creditsUsed.isFinite && $0.creditsUsed > 0 }
+        guard !services.isEmpty,
+              let total = self.finiteSum(services.map(\.creditsUsed)),
+              total > 0
+        else { return nil }
+        return OpenAIDashboardDailyBreakdown(day: day.day, services: services, totalCreditsUsed: total)
+    }
+
+    private static func finiteSum(_ values: [Double]) -> Double? {
+        var total = 0.0
+        for value in values {
+            let next = total + value
+            guard next.isFinite else { return nil }
+            total = next
+        }
+        return values.isEmpty ? nil : total
+    }
+
+    private static func date(fromDayKey key: String, calendar: Calendar) -> Date? {
+        let parts = key.split(separator: "-", omittingEmptySubsequences: false)
+        guard parts.count == 3,
+              let year = Int(parts[0]),
+              let month = Int(parts[1]),
+              let day = Int(parts[2])
+        else { return nil }
+        let components = DateComponents(
+            calendar: calendar,
+            timeZone: calendar.timeZone,
+            year: year,
+            month: month,
+            day: day,
+            hour: 12)
+        guard let date = calendar.date(from: components) else { return nil }
+        let resolved = calendar.dateComponents([.year, .month, .day], from: date)
+        guard resolved.year == year, resolved.month == month, resolved.day == day else { return nil }
+        return date
+    }
+
+    private static func dayKey(from date: Date, calendar: Calendar) -> String {
+        let components = calendar.dateComponents([.year, .month, .day], from: date)
+        return String(
+            format: "%04d-%02d-%02d",
+            components.year ?? 0,
+            components.month ?? 0,
+            components.day ?? 0)
+    }
+}
+
+public struct OpenAIDashboardUsageBreakdownSummary: Equatable, Sendable {
+    public let historyDays: Int
+    public let todayCredits: Double?
+    public let totalCredits: Double?
+    public let daily: [OpenAIDashboardDailyBreakdown]
+
+    public init(
+        historyDays: Int,
+        todayCredits: Double?,
+        totalCredits: Double?,
+        daily: [OpenAIDashboardDailyBreakdown])
+    {
+        self.historyDays = historyDays
+        self.todayCredits = todayCredits
+        self.totalCredits = totalCredits
+        self.daily = daily
+    }
 }
 
 public struct OpenAIDashboardServiceUsage: Codable, Equatable, Sendable {
@@ -197,6 +356,8 @@ public struct OpenAIDashboardCache: Codable, Equatable, Sendable {
 }
 
 public enum OpenAIDashboardCacheStore {
+    @TaskLocal static var cacheURLOverride: URL?
+
     public static func load() -> OpenAIDashboardCache? {
         guard let url = self.cacheURL else { return nil }
         guard let data = try? Data(contentsOf: url) else { return nil }
@@ -226,6 +387,9 @@ public enum OpenAIDashboardCacheStore {
     }
 
     private static var cacheURL: URL? {
+        if let cacheURLOverride {
+            return cacheURLOverride
+        }
         guard let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
             return nil
         }

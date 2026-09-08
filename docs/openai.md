@@ -15,7 +15,10 @@ CodexBar's OpenAI API provider targets the API Platform organization dashboard, 
    - `GET https://api.openai.com/v1/organization/costs`
    - `GET https://api.openai.com/v1/organization/usage/completions`
    - Daily buckets use `bucket_width=1d`, costs are grouped by `line_item`, and completion usage is grouped by `model`.
-2. Fallback: legacy `GET https://api.openai.com/v1/dashboard/billing/credit_grants` for normal API keys that cannot access organization usage.
+   - Optional project scoping comes from `OPENAI_PROJECT_ID` or `providers[].workspaceID` for `openai`.
+     Project-scoped requests add `project_ids=<project>` to both Admin API endpoints.
+2. Best-effort fallback: legacy `GET https://api.openai.com/v1/dashboard/billing/credit_grants` for older user API
+   keys that cannot access organization usage. This endpoint is not part of OpenAI's current public API reference.
 
 ## Setup
 
@@ -29,12 +32,33 @@ Settings → Providers → OpenAI writes the same `~/.codexbar/config.json` fiel
 `OPENAI_API_KEY` because it unlocks organization costs and usage; a normal API key only supports the legacy balance
 fallback.
 
+Project service-account keys are project-scoped credentials for API workloads. They are not organization Admin API
+keys, so they cannot read the organization usage and cost endpoints used by CodexBar. Configure an organization Admin
+API key instead; CodexBar reports this distinction when a project or service-account key is rejected.
+
+To scope Admin API usage to a project, set the OpenAI Project ID field in Settings or add `workspaceID` to the `openai`
+provider config:
+
+```json
+{
+  "id": "openai",
+  "apiKey": "<OPENAI_ADMIN_KEY>",
+  "workspaceID": "proj_..."
+}
+```
+
+Project scoping is tied to the configured Admin API key. Selected OpenAI token accounts intentionally scrub
+`OPENAI_PROJECT_ID`/`workspaceID` so one account cannot inherit another account's project filter. Project-scoped Admin
+API failures do not fall back to the legacy billing endpoint, because that endpoint is not project-filtered.
+
 ## Menu display
 
 - Admin API data renders inline Today/7d/configured-window KPIs plus a compact spend chart.
 - The inline usage card opens a hosted chart submenu with daily spend, token, and request trends plus selected-day detail.
 - Top model and top spend labels come from the configured completion/cost buckets when the Admin API returns them.
 - Legacy balance data keeps the older available/used credit summary and does not show organization graphs.
+- Project-scoped Admin API data labels the account as `Admin API: <project>` and the organization line as
+  `Project: <project>`.
 
 ## Notes
 

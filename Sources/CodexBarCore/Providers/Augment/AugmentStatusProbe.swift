@@ -15,12 +15,15 @@ public enum AugmentCookieImporter {
     /// NOTE: This list may not be exhaustive. If authentication fails with cookies present,
     /// check debug logs for cookie names and report them.
     private static let sessionCookieNames: Set<String> = [
-        "_session", // Legacy session cookie
+        "session", // Augment auth session (auth.augmentcode.com)
+        "_session", // Legacy session cookie (app.augmentcode.com)
+        "web_rpc_proxy_session", // Augment RPC proxy session
         "auth0", // Auth0 session
         "auth0.is.authenticated", // Auth0 authentication flag
         "a0.spajs.txs", // Auth0 SPA transaction state
         "__Secure-next-auth.session-token", // NextAuth secure session
         "next-auth.session-token", // NextAuth session
+        "__Secure-authjs.session-token", // AuthJS secure session
         "__Host-authjs.csrf-token", // AuthJS CSRF token
         "authjs.session-token", // AuthJS session
     ]
@@ -266,13 +269,11 @@ public actor AugmentSessionStore {
     private var hasLoadedFromDisk = false
     private let fileURL: URL
 
-    private init() {
-        let fm = FileManager.default
-        let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? fm.temporaryDirectory
-        let dir = appSupport.appendingPathComponent("CodexBar", isDirectory: true)
-        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
-        self.fileURL = dir.appendingPathComponent("augment-session.json")
+    init(fileURL: URL? = nil) {
+        self.fileURL = fileURL ?? ProviderSessionStoreFile.url(for: "augment-session.json")
+        guard fileURL == nil else { return }
+        try? FileManager.default.createDirectory(
+            at: self.fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
 
         // Load saved cookies on init
         Task { await self.loadFromDiskIfNeeded() }
@@ -313,6 +314,7 @@ public actor AugmentSessionStore {
     private func loadFromDiskIfNeeded() {
         guard !self.hasLoadedFromDisk else { return }
         self.hasLoadedFromDisk = true
+        CredentialFileWriter.repairPermissions(at: self.fileURL)
         self.loadFromDisk()
     }
 
@@ -346,7 +348,7 @@ public actor AugmentSessionStore {
         else {
             return
         }
-        try? data.write(to: self.fileURL)
+        try? CredentialFileWriter.writePrivate(data, to: self.fileURL)
     }
 
     private func loadFromDisk() {
@@ -359,7 +361,9 @@ public actor AugmentSessionStore {
             var cookieProps: [HTTPCookiePropertyKey: Any] = [:]
             for (key, value) in props {
                 // Skip marker keys
-                if key.hasSuffix("_isDate") || key.hasSuffix("_isURL") { continue }
+                if key.hasSuffix("_isDate") || key.hasSuffix("_isURL") {
+                    continue
+                }
 
                 let propKey = HTTPCookiePropertyKey(key)
 
@@ -639,7 +643,9 @@ public struct AugmentStatusProbe: Sendable {
     @MainActor private static var recentDumps: [String] = []
 
     @MainActor private static func recordDump(_ text: String) {
-        if self.recentDumps.count >= 5 { self.recentDumps.removeFirst() }
+        if self.recentDumps.count >= 5 {
+            self.recentDumps.removeFirst()
+        }
         self.recentDumps.append(text)
     }
 

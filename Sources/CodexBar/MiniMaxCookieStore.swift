@@ -22,7 +22,7 @@ enum MiniMaxCookieStoreError: LocalizedError {
 }
 
 struct KeychainMiniMaxCookieStore: MiniMaxCookieStoring {
-    private static let log = CodexBarLog.logger(LogCategories.minimaxCookieStore)
+    private static let log = CodexBarLog.logger(LogCategories.provider(.minimax, scope: "cookie-store"))
 
     private let service = "com.steipete.CodexBar"
     private let account = "minimax-cookie"
@@ -41,8 +41,9 @@ struct KeychainMiniMaxCookieStore: MiniMaxCookieStoring {
             kSecReturnData as String: true,
         ]
 
-        if case .interactionRequired = KeychainAccessPreflight
-            .checkGenericPassword(service: self.service, account: self.account)
+        if KeychainAccessPreflight.checkGenericPassword(
+            service: self.service,
+            account: self.account).requiresInteraction
         {
             KeychainPromptHandler.handler?(KeychainPromptContext(
                 kind: .minimaxCookie,
@@ -50,7 +51,7 @@ struct KeychainMiniMaxCookieStore: MiniMaxCookieStoring {
                 account: self.account))
         }
 
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        let status = KeychainSecurity.copyMatching(query as CFDictionary, &result)
         if status == errSecItemNotFound {
             return nil
         }
@@ -96,7 +97,7 @@ struct KeychainMiniMaxCookieStore: MiniMaxCookieStoring {
             kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
         ]
 
-        let updateStatus = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+        let updateStatus = KeychainSecurity.update(query as CFDictionary, attributes as CFDictionary)
         if updateStatus == errSecSuccess {
             return
         }
@@ -109,7 +110,7 @@ struct KeychainMiniMaxCookieStore: MiniMaxCookieStoring {
         for (key, value) in attributes {
             addQuery[key] = value
         }
-        let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
+        let addStatus = KeychainSecurity.add(addQuery as CFDictionary, nil)
         guard addStatus == errSecSuccess else {
             Self.log.error("Keychain add failed: \(addStatus)")
             throw MiniMaxCookieStoreError.keychainStatus(addStatus)
@@ -123,7 +124,7 @@ struct KeychainMiniMaxCookieStore: MiniMaxCookieStoring {
             kSecAttrService as String: self.service,
             kSecAttrAccount as String: self.account,
         ]
-        let status = SecItemDelete(query as CFDictionary)
+        let status = KeychainSecurity.delete(query as CFDictionary)
         if status == errSecSuccess || status == errSecItemNotFound {
             return
         }

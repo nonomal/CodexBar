@@ -54,7 +54,8 @@ struct CostUsageScannerClaudeRegressionTests {
         let parsed = CostUsageScanner.parseClaudeFile(
             fileURL: fileURL,
             range: CostUsageScanner.CostUsageDayRange(since: day, until: day),
-            providerFilter: .all)
+            providerFilter: .all,
+            modelsDevCacheRoot: env.cacheRoot)
 
         #expect(parsed.rows.count == 1)
         #expect(parsed.rows[0].sessionId == "parse-session")
@@ -106,7 +107,8 @@ struct CostUsageScannerClaudeRegressionTests {
         let parsed = CostUsageScanner.parseClaudeFile(
             fileURL: fileURL,
             range: CostUsageScanner.CostUsageDayRange(since: day, until: day),
-            providerFilter: .all)
+            providerFilter: .all,
+            modelsDevCacheRoot: env.cacheRoot)
 
         #expect(parsed.rows.count == 2)
         #expect(parsed.rows.map(\.input).sorted() == [11, 13])
@@ -145,10 +147,60 @@ struct CostUsageScannerClaudeRegressionTests {
         let parsed = CostUsageScanner.parseClaudeFile(
             fileURL: fileURL,
             range: CostUsageScanner.CostUsageDayRange(since: day, until: day),
-            providerFilter: .all)
+            providerFilter: .all,
+            modelsDevCacheRoot: env.cacheRoot)
 
         #expect(parsed.rows.count == 1)
         #expect(parsed.rows[0].model == "claude-opus-4-7")
+        #expect(parsed.rows[0].input == 6)
+        #expect(parsed.rows[0].cacheCreate == 1389)
+        #expect(parsed.rows[0].cacheRead == 50352)
+        #expect(parsed.rows[0].output == 3922)
+
+        let expected = 0.13193725
+        #expect(abs((Double(parsed.rows[0].costNanos) / 1_000_000_000) - expected) < 0.000000001)
+    }
+
+    /// Regression for https://github.com/steipete/CodexBar/issues/1210: an Opus 4.8 row
+    /// priced to an empty cost because the built-in Claude pricing table had no
+    /// claude-opus-4-8 entry (used when the models.dev cache is missing/stale).
+    @Test
+    func `claude opus 4 8 issue row gets priced`() throws {
+        let env = try CostUsageTestEnvironment()
+        defer { env.cleanup() }
+
+        let day = try env.makeLocalNoon(year: 2026, month: 5, day: 29)
+        let fileURL = try env.writeClaudeProjectFile(
+            relativePath: "project-a/opus-48.jsonl",
+            contents: env.jsonl([
+                [
+                    "message": [
+                        "model": "claude-opus-4-8",
+                        "id": "msg_01NrvWoSMk2Eig6vkCgyRZqc",
+                        "type": "message",
+                        "role": "assistant",
+                        "usage": [
+                            "input_tokens": 6,
+                            "cache_creation_input_tokens": 1389,
+                            "cache_read_input_tokens": 50352,
+                            "output_tokens": 3922,
+                        ],
+                    ],
+                    "requestId": "req_011CaLLcFQD712ZnCTxHFk71",
+                    "type": "assistant",
+                    "timestamp": "2026-05-29T07:51:34.428Z",
+                    "sessionId": "39d4b923-8273-4c35-ad9c-e098395286f1",
+                ],
+            ]))
+
+        let parsed = CostUsageScanner.parseClaudeFile(
+            fileURL: fileURL,
+            range: CostUsageScanner.CostUsageDayRange(since: day, until: day),
+            providerFilter: .all,
+            modelsDevCacheRoot: env.cacheRoot)
+
+        #expect(parsed.rows.count == 1)
+        #expect(parsed.rows[0].model == "claude-opus-4-8")
         #expect(parsed.rows[0].input == 6)
         #expect(parsed.rows[0].cacheCreate == 1389)
         #expect(parsed.rows[0].cacheRead == 50352)
@@ -715,13 +767,15 @@ struct CostUsageScannerClaudeRegressionTests {
             inputTokens: 1000,
             cacheReadInputTokens: 100,
             cacheCreationInputTokens: 50,
-            outputTokens: 25)
+            outputTokens: 25,
+            modelsDevCatalog: ModelsDevCatalog(providers: [:]))
         let datedCost = CostUsagePricing.claudeCostUSD(
             model: "claude-sonnet-4-6-20260219",
             inputTokens: 1000,
             cacheReadInputTokens: 100,
             cacheCreationInputTokens: 50,
-            outputTokens: 25)
+            outputTokens: 25,
+            modelsDevCatalog: ModelsDevCatalog(providers: [:]))
 
         #expect(baseCost != nil)
         #expect(datedCost != nil)

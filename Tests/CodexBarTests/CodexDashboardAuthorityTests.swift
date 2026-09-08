@@ -75,6 +75,7 @@ struct CodexDashboardAuthorityTests {
 
         #expect(decision.disposition == .displayOnly)
         #expect(decision.reason == .sameEmailAmbiguity(email: "shared@example.com"))
+        #expect(decision.allowedEffects.isEmpty)
     }
 
     @Test
@@ -102,6 +103,91 @@ struct CodexDashboardAuthorityTests {
 
         #expect(decision.disposition == .attach)
         #expect(decision.reason == .exactProviderAccountMatch)
+    }
+
+    @Test
+    func `provider account exact owner ignores duplicate profile isolation`() {
+        let input = CodexDashboardAuthorityInput(
+            sourceKind: .liveWeb,
+            proof: CodexDashboardOwnershipProofContext(
+                currentIdentity: .providerAccount(id: "acct-owner"),
+                expectedScopedEmail: "owner@example.com",
+                trustedCurrentUsageEmail: nil,
+                dashboardSignedInEmail: "owner@example.com",
+                knownOwners: [
+                    CodexDashboardKnownOwnerCandidate(
+                        identity: .providerAccount(id: "acct-owner"),
+                        normalizedEmail: "owner@example.com",
+                        sourceIsolationIdentifier: "profile-a"),
+                    CodexDashboardKnownOwnerCandidate(
+                        identity: .providerAccount(id: "acct-owner"),
+                        normalizedEmail: "owner@example.com",
+                        sourceIsolationIdentifier: "profile-b"),
+                ]),
+            routing: CodexDashboardRoutingHints(
+                targetEmail: "owner@example.com",
+                lastKnownDashboardRoutingEmail: nil))
+
+        let decision = CodexDashboardAuthority.evaluate(input)
+
+        #expect(decision.disposition == .attach)
+        #expect(decision.reason == .exactProviderAccountMatch)
+    }
+
+    @Test
+    func `email only owners retain profile isolation ambiguity`() {
+        let input = CodexDashboardAuthorityInput(
+            sourceKind: .liveWeb,
+            proof: CodexDashboardOwnershipProofContext(
+                currentIdentity: .emailOnly(normalizedEmail: "shared@example.com"),
+                expectedScopedEmail: "shared@example.com",
+                trustedCurrentUsageEmail: nil,
+                dashboardSignedInEmail: "shared@example.com",
+                knownOwners: [
+                    CodexDashboardKnownOwnerCandidate(
+                        identity: .emailOnly(normalizedEmail: "shared@example.com"),
+                        normalizedEmail: "shared@example.com",
+                        sourceIsolationIdentifier: "profile-a"),
+                    CodexDashboardKnownOwnerCandidate(
+                        identity: .emailOnly(normalizedEmail: "shared@example.com"),
+                        normalizedEmail: "shared@example.com",
+                        sourceIsolationIdentifier: "profile-b"),
+                ]),
+            routing: CodexDashboardRoutingHints(
+                targetEmail: "shared@example.com",
+                lastKnownDashboardRoutingEmail: nil))
+
+        let decision = CodexDashboardAuthority.evaluate(input)
+
+        #expect(decision.disposition == .displayOnly)
+        #expect(decision.reason == .sameEmailAmbiguity(email: "shared@example.com"))
+    }
+
+    @Test
+    func `provider account exact owner stays display only when email has another owner`() {
+        let input = CodexDashboardAuthorityInput(
+            sourceKind: .liveWeb,
+            proof: CodexDashboardOwnershipProofContext(
+                currentIdentity: .providerAccount(id: "acct-current"),
+                expectedScopedEmail: "shared@example.com",
+                trustedCurrentUsageEmail: nil,
+                dashboardSignedInEmail: "shared@example.com",
+                knownOwners: [
+                    CodexDashboardKnownOwnerCandidate(
+                        identity: .providerAccount(id: "acct-current"),
+                        normalizedEmail: "shared@example.com"),
+                    CodexDashboardKnownOwnerCandidate(
+                        identity: .providerAccount(id: "acct-other"),
+                        normalizedEmail: "shared@example.com"),
+                ]),
+            routing: CodexDashboardRoutingHints(
+                targetEmail: "shared@example.com",
+                lastKnownDashboardRoutingEmail: nil))
+
+        let decision = CodexDashboardAuthority.evaluate(input)
+
+        #expect(decision.disposition == .displayOnly)
+        #expect(decision.reason == .sameEmailAmbiguity(email: "shared@example.com"))
     }
 
     @Test
@@ -275,6 +361,7 @@ struct CodexDashboardAuthorityTests {
 
         #expect(decision.disposition == .attach)
         #expect(decision.allowedEffects == Set([
+            .subscriptionMetadataAttachment,
             .usageBackfill,
             .creditsAttachment,
             .refreshGuardSeed,
